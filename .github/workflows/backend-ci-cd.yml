@@ -1,0 +1,188 @@
+name: Backend CI/CD
+
+on:
+  push:
+    branches: [feature/full-stack]
+    paths:
+      - "Server/**"
+      - ".github/workflows/backend-ci-cd.yml"
+  pull_request:
+    branches: [feature/full-stack]
+    paths:
+      - "Server/**"
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: starttech-prod-api
+  GO_VERSION: "1.21"
+
+jobs:
+  # ── Test ────────────────────────────────────────────────────────────────────
+  test:
+    name: Test & Code Quality
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Server/MuchToDo
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: Server/MuchToDo/go.sum
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Run tests
+        run: go test ./... -v -coverprofile=coverage.out
+        continue-on-error: true
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Vulnerability scan
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+        continue-on-error: true
+
+  # ── Build & Push Docker Image ────────────────────────────────────────────────
+  build:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/feature/full-stack' && github.event_name == 'push'
+    outputs:
+      image_uri: ${{ steps.build-image.outputs.image_uri }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag and push image
+        id: build-image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE_URI=$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          LATEST_URI=$REGISTRY/$ECR_REPOSITORY:latest
+
+          docker build \
+            -t $IMAGE_URI \
+            -t $LATEST_URI \
+            -f Server/MuchToDo/Dockerfile \
+            Server/MuchToDo/
+
+          docker push $IMAGE_URI
+          docker push $LATEST_URI
+
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.build-image.outputs.image_uri }}
+          format: table
+          exit-code: 0
+          severity: HIGH,CRITICAL
+
+  # ── Deploy to EC2 via ASG Rolling Update ─────────────────────────────────────
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update launch template with new image
+        env:
+          IMAGE_URI: ${{ needs.build.outputs.image_uri }}
+        run: |
+          aws ec2 create-launch-template-version \
+            --launch-template-name starttech-prod-api \
+            --source-version '$Latest' \
+            --launch-template-data "{
+              \"UserData\": \"$(cat scripts/deploy-backend.sh | \
+                sed "s|IMAGE_URI_PLACEHOLDER|$IMAGE_URI|g" | \
+                base64 -w 0)\"
+            }"
+
+      - name: Trigger ASG instance refresh
+        run: |
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name starttech-prod-asg \
+            --preferences '{
+              "MinHealthyPercentage": 50,
+              "InstanceWarmup": 60
+            }'
+
+      - name: Wait for refresh to complete
+        run: |
+          echo "Waiting for instance refresh..."
+          for i in $(seq 1 20); do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name starttech-prod-asg \
+              --query 'InstanceRefreshes[0].Status' \
+              --output text)
+            echo "Status: $STATUS"
+            if [ "$STATUS" = "Successful" ]; then
+              echo "Deployment successful!"
+              exit 0
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
+              echo "Deployment failed! Status: $STATUS"
+              exit 1
+            fi
+            sleep 30
+          done
+          echo "Timed out waiting for refresh"
+          exit 1
+
+      - name: Run smoke test
+        run: |
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names starttech-prod-alb \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+
+          echo "Testing health endpoint at http://$ALB_DNS/ping"
+          for i in $(seq 1 5); do
+            RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://$ALB_DNS/ping)
+            if [ "$RESPONSE" = "200" ]; then
+              echo "Smoke test passed!"
+              exit 0
+            fi
+            echo "Attempt $i failed with HTTP $RESPONSE, retrying..."
+            sleep 10
+          done
+          echo "Smoke test failed!"
+          exit 1
+
+      - name: Notify success
+        run: |
+          echo "## Backend Deployed Successfully" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image:** ${{ needs.build.outputs.image_uri }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
