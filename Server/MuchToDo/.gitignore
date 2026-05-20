@@ -1,0 +1,5 @@
+muchtodo
+*.tar.gz
+docker-compose.yaml.bak
+mongodb.key
+.env
