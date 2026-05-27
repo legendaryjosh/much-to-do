@@ -5,6 +5,7 @@ on:
     branches: [feature/full-stack]
     paths:
       - "Server/**"
+      - "scripts/deploy-backend.sh"
       - ".github/workflows/backend-ci-cd.yml"
   pull_request:
     branches: [feature/full-stack]
@@ -101,7 +102,7 @@ jobs:
           exit-code: 0
           severity: HIGH,CRITICAL
 
-  # ── Deploy to EC2 via ASG Rolling Update ─────────────────────────────────────
+  # ── Deploy to EC2 ─────────────────────────────────────────────────────────
   deploy:
     name: Deploy to EC2
     runs-on: ubuntu-latest
@@ -118,32 +119,39 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Cancel any existing instance refresh
+        run: |
+          aws autoscaling cancel-instance-refresh \
+            --auto-scaling-group-name starttech-prod-asg \
+            --region ${{ env.AWS_REGION }} || true
+          sleep 30
+
       - name: Update launch template with new image
         env:
           IMAGE_URI: ${{ needs.build.outputs.image_uri }}
         run: |
+          USERDATA=$(cat scripts/deploy-backend.sh | \
+            sed "s|IMAGE_URI_PLACEHOLDER|$IMAGE_URI|g" | \
+            base64 -w 0)
+
           aws ec2 create-launch-template-version \
             --launch-template-name starttech-prod-api \
             --source-version '$Latest' \
-            --launch-template-data "{
-              \"UserData\": \"$(cat scripts/deploy-backend.sh | \
-                sed "s|IMAGE_URI_PLACEHOLDER|$IMAGE_URI|g" | \
-                base64 -w 0)\"
-            }"
+            --launch-template-data "{\"UserData\":\"$USERDATA\"}"
 
       - name: Trigger ASG instance refresh
         run: |
           aws autoscaling start-instance-refresh \
             --auto-scaling-group-name starttech-prod-asg \
             --preferences '{
-              "MinHealthyPercentage": 50,
-              "InstanceWarmup": 60
+              "MinHealthyPercentage": 0,
+              "InstanceWarmup": 180
             }'
 
       - name: Wait for refresh to complete
         run: |
           echo "Waiting for instance refresh..."
-          for i in $(seq 1 20); do
+          for i in $(seq 1 30); do
             STATUS=$(aws autoscaling describe-instance-refreshes \
               --auto-scaling-group-name starttech-prod-asg \
               --query 'InstanceRefreshes[0].Status' \
@@ -176,7 +184,7 @@ jobs:
               exit 0
             fi
             echo "Attempt $i failed with HTTP $RESPONSE, retrying..."
-            sleep 10
+            sleep 15
           done
           echo "Smoke test failed!"
           exit 1
