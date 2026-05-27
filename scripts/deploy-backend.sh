@@ -2,14 +2,22 @@
 set -e
 
 # ── Deploy Backend to EC2 via Docker ─────────────────────────────────────────
-# This script runs on each EC2 instance during ASG instance refresh
-# IMAGE_URI_PLACEHOLDER is replaced by the CI/CD pipeline at deploy time
-
 IMAGE_URI="IMAGE_URI_PLACEHOLDER"
 AWS_REGION="us-east-1"
 APP_NAME="muchtodo-api"
 
 echo "Starting deployment of $IMAGE_URI"
+
+# Install Docker first
+yum install -y docker
+systemctl enable docker
+systemctl start docker
+
+# Wait for Docker to be ready
+sleep 15
+
+# Install AWS CLI
+yum install -y aws-cli
 
 # Login to ECR
 aws ecr get-login-password --region $AWS_REGION | \
@@ -25,20 +33,20 @@ MONGO_URI=$(aws ssm get-parameter \
   --name "/starttech/prod/mongo-uri" \
   --with-decryption \
   --query Parameter.Value \
-  --output text)
-
-REDIS_ADDR=$(aws ssm get-parameter \
-  --name "/starttech/prod/redis-addr" \
-  --query Parameter.Value \
-  --output text)
+  --output text --region $AWS_REGION)
 
 JWT_SECRET=$(aws ssm get-parameter \
   --name "/starttech/prod/jwt-secret" \
   --with-decryption \
   --query Parameter.Value \
-  --output text)
+  --output text --region $AWS_REGION)
 
-# Stop and remove existing container
+REDIS_ADDR=$(aws ssm get-parameter \
+  --name "/starttech/prod/redis-addr" \
+  --query Parameter.Value \
+  --output text --region $AWS_REGION)
+
+# Stop existing container
 echo "Stopping existing container..."
 docker stop $APP_NAME 2>/dev/null || true
 docker rm $APP_NAME 2>/dev/null || true
@@ -51,7 +59,7 @@ docker run -d \
   -p 8080:8080 \
   -e PORT=8080 \
   -e MONGO_URI="$MONGO_URI" \
-  -e DB_NAME="muchtodo" \
+  -e DB_NAME="much_todo_db" \
   -e REDIS_ADDR="$REDIS_ADDR" \
   -e ENABLE_CACHE=true \
   -e JWT_SECRET_KEY="$JWT_SECRET" \
@@ -61,7 +69,7 @@ docker run -d \
   $IMAGE_URI
 
 echo "Waiting for container to be healthy..."
-sleep 10
+sleep 15
 
 # Quick health check
 RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/ping)
@@ -73,7 +81,5 @@ else
   exit 1
 fi
 
-# Clean up old images
 docker image prune -f
-
 echo "Done!"
