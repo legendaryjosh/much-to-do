@@ -24,36 +24,39 @@ aws ecr get-login-password --region $AWS_REGION | \
 echo "Pulling image..."
 docker pull $IMAGE_URI
 
-# Fetch secrets from SSM into files to avoid shell interpretation issues
-aws ssm get-parameter \
+# Fetch mongo URI and debug
+RAW_MONGO=$(aws ssm get-parameter \
   --name "/starttech/prod/mongo-uri" \
   --with-decryption \
   --query Parameter.Value \
-  --output text --region $AWS_REGION > /tmp/mongo_uri.txt
+  --output text --region $AWS_REGION)
 
-aws ssm get-parameter \
+echo "DEBUG - First 20 chars of MONGO_URI: ${RAW_MONGO:0:20}"
+echo "DEBUG - URI length: ${#RAW_MONGO}"
+
+# Write to env file
+printf "PORT=8080\n" > /tmp/app.env
+printf "MONGO_URI=%s\n" "$RAW_MONGO" >> /tmp/app.env
+printf "DB_NAME=much_todo_db\n" >> /tmp/app.env
+printf "ENABLE_CACHE=false\n" >> /tmp/app.env
+printf "JWT_EXPIRATION_HOURS=72\n" >> /tmp/app.env
+printf "LOG_LEVEL=info\n" >> /tmp/app.env
+printf "LOG_FORMAT=json\n" >> /tmp/app.env
+
+# Fetch JWT secret
+RAW_JWT=$(aws ssm get-parameter \
   --name "/starttech/prod/jwt-secret" \
   --with-decryption \
   --query Parameter.Value \
-  --output text --region $AWS_REGION > /tmp/jwt_secret.txt
+  --output text --region $AWS_REGION)
+printf "JWT_SECRET_KEY=%s\n" "$RAW_JWT" >> /tmp/app.env
 
-echo "Mongo URI fetched: $(cat /tmp/mongo_uri.txt | cut -c1-30)..."
+echo "DEBUG - env file contents (first line only):"
+head -2 /tmp/app.env
 
 # Stop existing container
 docker stop $APP_NAME 2>/dev/null || true
 docker rm $APP_NAME 2>/dev/null || true
-
-# Run new container using env file
-cat > /tmp/app.env << ENVEOF
-PORT=8080
-MONGO_URI=$(cat /tmp/mongo_uri.txt)
-DB_NAME=much_todo_db
-ENABLE_CACHE=false
-JWT_SECRET_KEY=$(cat /tmp/jwt_secret.txt)
-JWT_EXPIRATION_HOURS=72
-LOG_LEVEL=info
-LOG_FORMAT=json
-ENVEOF
 
 echo "Starting container..."
 docker run -d \
@@ -77,7 +80,6 @@ for i in $(seq 1 10); do
   echo "Health check attempt $i: HTTP $RESPONSE"
   if [ "$RESPONSE" = "200" ]; then
     echo "Health check passed!"
-    # Cleanup sensitive files
     rm -f /tmp/mongo_uri.txt /tmp/jwt_secret.txt /tmp/app.env
     exit 0
   fi
@@ -86,5 +88,5 @@ done
 
 echo "Health check failed - showing final logs:"
 docker logs $APP_NAME --tail 50
-rm -f /tmp/mongo_uri.txt /tmp/jwt_secret.txt /tmp/app.env
+rm -f /tmp/app.env
 exit 1
