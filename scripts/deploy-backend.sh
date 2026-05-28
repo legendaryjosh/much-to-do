@@ -41,7 +41,7 @@ JWT_SECRET=$(aws ssm get-parameter \
 docker stop $APP_NAME 2>/dev/null || true
 docker rm $APP_NAME 2>/dev/null || true
 
-# Run new container WITHOUT Redis first
+# Run new container WITHOUT Redis
 echo "Starting container..."
 docker run -d \
   --name $APP_NAME \
@@ -57,27 +57,26 @@ docker run -d \
   -e LOG_FORMAT=json \
   $IMAGE_URI
 
-echo "Waiting for container to start..."
-sleep 30
+echo "Waiting 60 seconds for app to start..."
+sleep 60
 
-# Check container is running
-if docker ps | grep -q $APP_NAME; then
-  echo "Container is running!"
-  docker logs $APP_NAME --tail 20
-else
-  echo "Container failed to start!"
-  docker logs $APP_NAME
-  exit 1
-fi
+# Show container logs
+echo "Container logs:"
+docker logs $APP_NAME --tail 30
 
-# Health check
-RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/ping)
-if [ "$RESPONSE" = "200" ]; then
-  echo "Health check passed!"
-else
-  echo "Health check failed with HTTP $RESPONSE"
-  docker logs $APP_NAME
-  exit 1
-fi
+# Health check with more retries
+for i in $(seq 1 10); do
+  RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+    --connect-timeout 5 --max-time 10 \
+    http://localhost:8080/ping 2>/dev/null || echo "000")
+  echo "Health check attempt $i: HTTP $RESPONSE"
+  if [ "$RESPONSE" = "200" ]; then
+    echo "Health check passed!"
+    exit 0
+  fi
+  sleep 10
+done
 
-echo "Done!"
+echo "Health check failed - showing final logs:"
+docker logs $APP_NAME --tail 50
+exit 1
